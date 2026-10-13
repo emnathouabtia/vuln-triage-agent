@@ -1,4 +1,4 @@
-import re
+﻿import re
 import requests
 from dataclasses import dataclass
 from typing import List
@@ -57,7 +57,7 @@ def search_cve(service: str, version: str, max_results: int = 5) -> List[CVEResu
     params = {"keywordSearch": f"{service} {version}", "resultsPerPage": max_results}
     return _query_nvd(NVD_API_URL, params)
 
-def search_cve_for_version(service: str, version: str, max_results: int = 20) -> List[CVEResult]:
+def search_cve_for_version(service: str, version: str, max_results: int = 200) -> List[CVEResult]:
     """Recherche exacte : seulement les CVE qui touchent cette version précise."""
     text = f"{service} {version}".lower()
     key = next((k for k in CPE_MAP if k in text), None)

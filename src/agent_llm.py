@@ -1,4 +1,5 @@
-import os
+﻿import os
+import re
 import json
 import time
 from groq import Groq
@@ -11,14 +12,14 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL = "openai/gpt-oss-20b"
 
 SYSTEM_PROMPT = (
-    "Tu es un analyste sécurité. Réponds UNIQUEMENT à partir des résultats de "
-    "l'outil search_cve. N'ajoute aucune CVE, date ou score CVSS qui n'apparaît "
-    "pas dans ces résultats. Ne décris une CVE que par ce qui est écrit dans sa "
-    "description, sans extrapoler ni ajouter de conséquence. Ne propose aucune "
-    "action de configuration qui ne découle pas directement d'une description. "
-    "N'indique aucun numéro de version cible : dis seulement de mettre à jour "
-    "vers la dernière version stable. Les scores CVSS sont fournis par l'outil : "
-    "affiche-les, ne dis jamais qu'ils manquent."
+    "Tu es un analyste sécurité. Utilise l'outil search_cve pour chaque service "
+    "du scan. N'ajoute aucune information qui ne vient pas de l'outil."
+)
+
+TRANSLATE_PROMPT = (
+    "Traduis chaque description de vulnérabilité en français, fidèlement, en une "
+    "phrase. N'ajoute rien, ne supprime rien, n'interprète pas. Réponds "
+    "uniquement avec une ligne par CVE au format : CVE-ID | traduction"
 )
 
 TOOLS = [
@@ -39,6 +40,15 @@ TOOLS = [
     }
 ]
 
+# Résultats collectés pendant les appels d'outil : (service, CVEResult)
+ALL_RESULTS = []
+
+
+def short_desc(text: str, limit: int = 400) -> str:
+    """Première phrase de la description, tronquée."""
+    first = re.split(r"(?<=[.!?])\s", text.strip())[0]
+    return first[:limit]
+
 
 def call_tool(name: str, args: dict) -> str:
     if name == "search_cve":
@@ -48,14 +58,59 @@ def call_tool(name: str, args: dict) -> str:
         cves = sorted(cves, key=lambda c: c.cvss_score, reverse=True)
         score, label = compute_priority(cves)
         summary = f"Priorité: {label} (CVSS max {score})\n"
-        for c in cves[:5]:
+        for c in cves[:10]:
+            ALL_RESULTS.append((args["service"], c))
             summary += f"- {c.cve_id} (CVSS {c.cvss_score}): {c.description[:300]}\n"
         return summary
     return "Outil inconnu."
 
 
+def translate(rows) -> dict:
+    """Traduit les descriptions en français ; renvoie {cve_id: traduction}."""
+    lines = "\n".join(f"{c.cve_id} | {short_desc(c.description)}" for _, c in rows)
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": TRANSLATE_PROMPT},
+                {"role": "user", "content": lines},
+            ],
+            max_completion_tokens=3000,
+            reasoning_effort="low",
+        )
+        out = r.choices[0].message.content or ""
+    except Exception as e:
+        print(f"[agent] Traduction impossible : {e}")
+        return {}
+    result = {}
+    for line in out.splitlines():
+        if "|" in line:
+            cid, txt = line.split("|", 1)
+            result[cid.strip().strip("*- ")] = txt.strip()
+    return result
+
+
+def print_report():
+    if not ALL_RESULTS:
+        print("Aucune CVE trouvée.")
+        return
+    rows = sorted(ALL_RESULTS, key=lambda r: r[1].cvss_score, reverse=True)
+    fr = translate(rows)
+    print("\n=== Rapport final (trié par CVSS décroissant) ===")
+    print("| Service | CVE | CVSS | Description |")
+    print("|---|---|---|---|")
+    for service, c in rows:
+        desc = fr.get(c.cve_id) or short_desc(c.description)
+        print(f"| {service} | {c.cve_id} | {c.cvss_score} | {desc} |")
+    print("\nAction : mettre à jour chaque service vers la dernière version stable.")
+
+
 def run_agent(raw_scan_text: str):
     findings = parse_nmap_text(raw_scan_text)
+    if not findings:
+        print("Aucun service avec version détectée dans le scan.")
+        return
+    ALL_RESULTS.clear()
     findings_text = "\n".join(str(f) for f in findings)
 
     messages = [
@@ -65,12 +120,8 @@ def run_agent(raw_scan_text: str):
             "content": (
                 f"Voici un rapport de scan réseau :\n{findings_text}\n\n"
                 "Pour CHAQUE service, appelle search_cve avec le nom du logiciel et "
-                "le numéro de version seul. Ensuite, réponds uniquement avec un "
-                "tableau Markdown contenant TOUTES les CVE reçues, classées du plus "
-                "urgent au moins urgent (CVSS décroissant), aux colonnes : "
-                "Service | CVE | CVSS | Description (reformulée en 12 mots maximum, "
-                "sans rien ajouter). Termine par une ligne unique : mettre à jour "
-                "chaque service vers la dernière version stable."
+                "le numéro de version seul. Quand tous les appels sont faits, "
+                "réponds uniquement : OK."
             ),
         },
     ]
@@ -82,21 +133,16 @@ def run_agent(raw_scan_text: str):
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            max_completion_tokens=4096,
+            max_completion_tokens=2048,
             reasoning_effort="low",
         )
-        choice = response.choices[0]
-        message = choice.message
+        message = response.choices[0].message
 
-        # Pas de demande d'outil : l'IA a fini, on affiche sa réponse
+        # Plus d'appel d'outil : le code construit le rapport lui-même
         if not message.tool_calls:
-            print("\n=== Recommandation finale ===")
-            print(message.content)
-            if choice.finish_reason == "length":
-                print("\n[ATTENTION] Réponse tronquée : augmente max_completion_tokens.")
-            return message.content
+            print_report()
+            return
 
-        # Sinon : on note sa demande, on exécute les outils, on renvoie les résultats
         messages.append({
             "role": "assistant",
             "content": message.content or "",
@@ -122,8 +168,16 @@ def run_agent(raw_scan_text: str):
 
 
 if __name__ == "__main__":
-    sample_scan = """
-    192.168.1.10 22 ssh OpenSSH 7.4
-    192.168.1.10 80 http Apache 2.4.29
-    """
-    run_agent(sample_scan)
+    scan_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scan.txt")
+    if os.path.exists(scan_path):
+        with open(scan_path, encoding="utf-8-sig", errors="ignore") as f:
+            scan_text = f.read()
+        print(f"[agent] scan lu depuis {os.path.normpath(scan_path)}")
+    else:
+        print("[agent] scan.txt introuvable, utilisation de l'exemple")
+        scan_text = """
+        192.168.1.10 22 ssh OpenSSH 7.4
+        192.168.1.10 80 http Apache 2.4.29
+        """
+    run_agent(scan_text)
+
