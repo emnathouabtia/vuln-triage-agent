@@ -25,7 +25,10 @@ def _split_product_version(text: str):
     match = VERSION_RE.search(text)
     if not match:
         return text.strip(), ""
-    return text[: match.start()].strip(), match.group(0)
+    # Plage nmap "9.6.0 - 9.6.5" : on garde la borne haute
+    rng = re.match(r"\s*-\s*(\d+(?:\.\d+)+(?:p\d+)?)", text[match.end():])
+    version = rng.group(1) if rng else match.group(0)
+    return text[: match.start()].strip(), version
 
 
 def parse_nmap_text(raw_text: str) -> List[Finding]:
@@ -75,3 +78,4 @@ if __name__ == "__main__":
 
 # Alias pour compatibilité avec prioritize.py
 ServiceFinding = Finding
+

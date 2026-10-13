@@ -8,19 +8,21 @@ from scan_parser import parse_nmap_text
 from cve_search import search_cve_for_version
 from prioritize import compute_priority
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=60.0, max_retries=3)
 
 MODEL = "openai/gpt-oss-20b"
+TOP_N = 5  # nombre de CVE gardées par logiciel (les plus graves)
 
 SYSTEM_PROMPT = (
-    "Tu es un analyste sécurité. Utilise l'outil search_cve pour chaque service "
-    "du scan. N'ajoute aucune information qui ne vient pas de l'outil."
+    "Tu es un analyste sécurité. Utilise l'outil search_cve pour chaque logiciel "
+    "de la liste. N'ajoute aucune information qui ne vient pas de l'outil."
 )
 
 TRANSLATE_PROMPT = (
     "Traduis chaque description de vulnérabilité en français, fidèlement, en une "
-    "phrase. N'ajoute rien, ne supprime rien, n'interprète pas, mais corrige les mots collés par une espace manquante. Réponds "
-    "uniquement avec une ligne par CVE au format : CVE-ID | traduction"
+    "phrase. N'ajoute rien, ne supprime rien, n'interprète pas, mais corrige les "
+    "mots collés par une espace manquante. Réponds uniquement avec une ligne par "
+    "CVE au format : CVE-ID | traduction"
 )
 
 TOOLS = [
@@ -32,7 +34,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string", "description": "Nom du logiciel, ex: 'OpenSSH', 'Apache'"},
+                    "service": {"type": "string", "description": "Nom du logiciel, ex: 'OpenSSH', 'Apache httpd'"},
                     "version": {"type": "string", "description": "Numéro de version seul, ex: '7.4'"},
                 },
                 "required": ["service", "version"],
@@ -41,13 +43,26 @@ TOOLS = [
     }
 ]
 
-# Résultats collectés pendant les appels d'outil : (service, CVEResult)
+# Résultats collectés pendant les appels d'outil : (service, hôtes, CVEResult)
 ALL_RESULTS = []
+# Services du scan : (produit, version, "hôte:port")
+SERVICES = []
 
 # CVE propres à une distribution : faux positifs pour un serveur Debian/Ubuntu
-DISTRO_NOISE = ("red hat enterprise linux", "rhel", "suse", "oracle linux")
+DISTRO_NOISE = ("red hat enterprise linux", "rhel", "suse", "oracle linux", "windows installer")
 
 SCAN_SOURCE = "exemple intégré"
+
+
+def safe_create(**kwargs):
+    """Appel Groq avec nouvelles tentatives ; renvoie None si l'API reste injoignable."""
+    for attempt in range(3):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            print(f"[agent] Appel Groq échoué ({type(e).__name__}), tentative {attempt + 1}/3")
+            time.sleep(5 * (attempt + 1))
+    return None
 
 
 def clean(text: str) -> str:
@@ -68,9 +83,33 @@ def short_desc(text: str, limit: int = 400) -> str:
     return out[:limit]
 
 
+def hosts_for(service: str, version: str) -> str:
+    """Liste des hôtes:ports du scan qui exécutent ce logiciel et cette version."""
+    s = service.lower()
+    found = []
+    for product, ver, where in SERVICES:
+        p = product.lower()
+        if product == service and ver == version and where not in found:
+            found.append(where)
+    return ", ".join(found) if found else "-"
+
+
+def resolve(service: str, version: str):
+    """Retrouve le logiciel du scan correspondant à l'appel du LLM (version exacte du scan)."""
+    s = service.lower()
+    for product, ver, _ in SERVICES:
+        p = product.lower()
+        if (s in p or p in s) and (ver.startswith(version) or version.startswith(ver)):
+            return product, ver
+    return service, version
+
+
 def call_tool(name: str, args: dict) -> str:
     if name == "search_cve":
-        cves = search_cve_for_version(args["service"], args["version"])
+        service, version = resolve(args["service"], args["version"])
+        if (service, version) != (args["service"], args["version"]):
+            print(f"[agent] version corrigée d'après le scan : {service} {version}")
+        cves = search_cve_for_version(service, version)
         before = len(cves)
         cves = [c for c in cves if not any(k in c.description.lower() for k in DISTRO_NOISE)]
         if before != len(cves):
@@ -79,9 +118,10 @@ def call_tool(name: str, args: dict) -> str:
             return "Aucune CVE trouvée."
         cves = sorted(cves, key=lambda c: c.cvss_score, reverse=True)
         score, label = compute_priority(cves)
+        where = hosts_for(service, version)
         summary = f"Priorité: {label} (CVSS max {score})\n"
-        for c in cves[:10]:
-            ALL_RESULTS.append((args["service"], c))
+        for c in cves[:TOP_N]:
+            ALL_RESULTS.append((service, where, c))
             summary += f"- {c.cve_id} (CVSS {c.cvss_score}): {clean(c.description)[:300]}\n"
         return summary
     return "Outil inconnu."
@@ -89,7 +129,10 @@ def call_tool(name: str, args: dict) -> str:
 
 def translate(rows) -> dict:
     """Traduit les descriptions en français ; renvoie {cve_id: traduction}."""
-    lines = "\n".join(f"{c.cve_id} | {short_desc(c.description)}" for _, c in rows)
+    unique = {}
+    for _, _, c in rows:
+        unique.setdefault(c.cve_id, c)
+    lines = "\n".join(f"{cid} | {short_desc(c.description)}" for cid, c in unique.items())
     try:
         r = client.chat.completions.create(
             model=MODEL,
@@ -97,7 +140,7 @@ def translate(rows) -> dict:
                 {"role": "system", "content": TRANSLATE_PROMPT},
                 {"role": "user", "content": lines},
             ],
-            max_completion_tokens=4000,
+            max_completion_tokens=6000,
             reasoning_effort="low",
         )
         out = r.choices[0].message.content or ""
@@ -116,24 +159,25 @@ def print_report():
     if not ALL_RESULTS:
         print("Aucune CVE trouvée.")
         return
-    rows = sorted(ALL_RESULTS, key=lambda r: r[1].cvss_score, reverse=True)
+    rows = sorted(ALL_RESULTS, key=lambda r: r[2].cvss_score, reverse=True)
     fr = translate(rows)
+    nb_hosts = len({w.split(":")[0] for _, _, w in SERVICES})
 
     lines = [
         "# Rapport de triage des vulnérabilités",
         "",
         f"- Date : {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"- Source du scan : {SCAN_SOURCE}",
-        "- Tri : CVSS décroissant (calculé par le code)",
+        f"- Source du scan : {SCAN_SOURCE} ({nb_hosts} hôte(s))",
+        f"- Tri : CVSS décroissant (calculé par le code), {TOP_N} CVE les plus graves par logiciel",
         "",
-        "| Service | CVE | CVSS | Description |",
-        "|---|---|---|---|",
+        "| Logiciel | Hôtes | CVE | CVSS | Description |",
+        "|---|---|---|---|---|",
     ]
-    for service, c in rows:
+    for service, where, c in rows:
         desc = fr.get(c.cve_id) or short_desc(c.description)
         desc = desc.replace("|", "/")
-        lines.append(f"| {service} | {c.cve_id} | {c.cvss_score} | {desc} |")
-    lines += ["", "Action : mettre à jour chaque service vers la dernière version stable."]
+        lines.append(f"| {service} | {where} | {c.cve_id} | {c.cvss_score} | {desc} |")
+    lines += ["", "Action : mettre à jour chaque logiciel vers la dernière version stable."]
     report = "\n".join(lines)
 
     print("\n=== Rapport final (trié par CVSS décroissant) ===")
@@ -151,24 +195,33 @@ def run_agent(raw_scan_text: str):
         print("Aucun service avec version détectée dans le scan.")
         return
     ALL_RESULTS.clear()
-    findings_text = "\n".join(str(f) for f in findings)
+    SERVICES.clear()
+    for f in findings:
+        SERVICES.append((f.product, f.version, f"{f.host}:{f.port}"))
+
+    # Un seul appel par logiciel+version, même s'il tourne sur plusieurs machines
+    unique = []
+    for product, version, _ in SERVICES:
+        if (product, version) not in unique:
+            unique.append((product, version))
+    software_list = "\n".join(f"- {p}, version {v}" for p, v in unique)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                f"Voici un rapport de scan réseau :\n{findings_text}\n\n"
-                "Pour CHAQUE service, appelle search_cve avec le nom du logiciel et "
-                "le numéro de version seul. Quand tous les appels sont faits, "
-                "réponds uniquement : OK."
+                f"Logiciels détectés par le scan :\n{software_list}\n\n"
+                "Pour CHAQUE logiciel de cette liste, appelle search_cve avec le nom "
+                "du logiciel et le numéro de version seul. Quand tous les appels sont "
+                "faits, réponds uniquement : OK."
             ),
         },
     ]
 
-    max_turns = 10  # garde-fou contre une boucle infinie
+    max_turns = 12  # garde-fou contre une boucle infinie
     for turn in range(max_turns):
-        response = client.chat.completions.create(
+        response = safe_create(
             model=MODEL,
             messages=messages,
             tools=TOOLS,
@@ -176,6 +229,10 @@ def run_agent(raw_scan_text: str):
             max_completion_tokens=2048,
             reasoning_effort="low",
         )
+        if response is None:
+            print("[agent] API Groq injoignable : rapport construit avec les CVE déjà collectées")
+            print_report()
+            return
         message = response.choices[0].message
 
         # Plus d'appel d'outil : le code construit le rapport lui-même
@@ -221,4 +278,5 @@ if __name__ == "__main__":
         192.168.1.10 80 http Apache 2.4.29
         """
     run_agent(scan_text)
+
 
