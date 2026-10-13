@@ -2,6 +2,7 @@
 import re
 import json
 import time
+from datetime import datetime
 from groq import Groq
 from scan_parser import parse_nmap_text
 from cve_search import search_cve_for_version
@@ -18,7 +19,7 @@ SYSTEM_PROMPT = (
 
 TRANSLATE_PROMPT = (
     "Traduis chaque description de vulnérabilité en français, fidèlement, en une "
-    "phrase. N'ajoute rien, ne supprime rien, n'interprète pas. Réponds "
+    "phrase. N'ajoute rien, ne supprime rien, n'interprète pas, mais corrige les mots collés par une espace manquante. Réponds "
     "uniquement avec une ligne par CVE au format : CVE-ID | traduction"
 )
 
@@ -43,16 +44,37 @@ TOOLS = [
 # Résultats collectés pendant les appels d'outil : (service, CVEResult)
 ALL_RESULTS = []
 
+# CVE propres à une distribution : faux positifs pour un serveur Debian/Ubuntu
+DISTRO_NOISE = ("red hat enterprise linux", "rhel", "suse", "oracle linux")
+
+SCAN_SOURCE = "exemple intégré"
+
+
+def clean(text: str) -> str:
+    """Normalise les espaces et retours à la ligne."""
+    return " ".join(text.split())
+
 
 def short_desc(text: str, limit: int = 400) -> str:
-    """Première phrase de la description, tronquée."""
-    first = re.split(r"(?<=[.!?])\s", text.strip())[0]
-    return first[:limit]
+    """Premières phrases de la description (jusqu'à ~120 caractères), tronquées."""
+    sentences = re.split(r"(?<=[.!?])\s", clean(text))
+    out = ""
+    for s in sentences:
+        if out and len(out) + len(s) > limit:
+            break
+        out = (out + " " + s).strip()
+        if len(out) >= 120:
+            break
+    return out[:limit]
 
 
 def call_tool(name: str, args: dict) -> str:
     if name == "search_cve":
         cves = search_cve_for_version(args["service"], args["version"])
+        before = len(cves)
+        cves = [c for c in cves if not any(k in c.description.lower() for k in DISTRO_NOISE)]
+        if before != len(cves):
+            print(f"[agent] {before - len(cves)} CVE spécifique(s) à une distribution ignorée(s)")
         if not cves:
             return "Aucune CVE trouvée."
         cves = sorted(cves, key=lambda c: c.cvss_score, reverse=True)
@@ -60,7 +82,7 @@ def call_tool(name: str, args: dict) -> str:
         summary = f"Priorité: {label} (CVSS max {score})\n"
         for c in cves[:10]:
             ALL_RESULTS.append((args["service"], c))
-            summary += f"- {c.cve_id} (CVSS {c.cvss_score}): {c.description[:300]}\n"
+            summary += f"- {c.cve_id} (CVSS {c.cvss_score}): {clean(c.description)[:300]}\n"
         return summary
     return "Outil inconnu."
 
@@ -75,7 +97,7 @@ def translate(rows) -> dict:
                 {"role": "system", "content": TRANSLATE_PROMPT},
                 {"role": "user", "content": lines},
             ],
-            max_completion_tokens=3000,
+            max_completion_tokens=4000,
             reasoning_effort="low",
         )
         out = r.choices[0].message.content or ""
@@ -96,13 +118,31 @@ def print_report():
         return
     rows = sorted(ALL_RESULTS, key=lambda r: r[1].cvss_score, reverse=True)
     fr = translate(rows)
-    print("\n=== Rapport final (trié par CVSS décroissant) ===")
-    print("| Service | CVE | CVSS | Description |")
-    print("|---|---|---|---|")
+
+    lines = [
+        "# Rapport de triage des vulnérabilités",
+        "",
+        f"- Date : {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"- Source du scan : {SCAN_SOURCE}",
+        "- Tri : CVSS décroissant (calculé par le code)",
+        "",
+        "| Service | CVE | CVSS | Description |",
+        "|---|---|---|---|",
+    ]
     for service, c in rows:
         desc = fr.get(c.cve_id) or short_desc(c.description)
-        print(f"| {service} | {c.cve_id} | {c.cvss_score} | {desc} |")
-    print("\nAction : mettre à jour chaque service vers la dernière version stable.")
+        desc = desc.replace("|", "/")
+        lines.append(f"| {service} | {c.cve_id} | {c.cvss_score} | {desc} |")
+    lines += ["", "Action : mettre à jour chaque service vers la dernière version stable."]
+    report = "\n".join(lines)
+
+    print("\n=== Rapport final (trié par CVSS décroissant) ===")
+    print(report)
+
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rapport.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(report + "\n")
+    print(f"\n[agent] rapport enregistré : {os.path.normpath(out_path)}")
 
 
 def run_agent(raw_scan_text: str):
@@ -172,6 +212,7 @@ if __name__ == "__main__":
     if os.path.exists(scan_path):
         with open(scan_path, encoding="utf-8-sig", errors="ignore") as f:
             scan_text = f.read()
+        SCAN_SOURCE = "scan.txt"
         print(f"[agent] scan lu depuis {os.path.normpath(scan_path)}")
     else:
         print("[agent] scan.txt introuvable, utilisation de l'exemple")
