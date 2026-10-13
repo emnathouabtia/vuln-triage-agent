@@ -2,3 +2,4 @@
 .env
 *.txt
 rapport.md
+rapport*.md
