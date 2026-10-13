@@ -12,6 +12,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=60.0, max_retries=
 
 MODEL = "openai/gpt-oss-20b"
 TOP_N = 5  # nombre de CVE gardées par logiciel (les plus graves)
+OUTPUT_PATH = None  # fichier du rapport (défaut : rapport.md à la racine)
 
 SYSTEM_PROMPT = (
     "Tu es un analyste sécurité. Utilise l'outil search_cve pour chaque logiciel "
@@ -183,7 +184,7 @@ def print_report():
     print("\n=== Rapport final (trié par CVSS décroissant) ===")
     print(report)
 
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rapport.md")
+    out_path = OUTPUT_PATH or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rapport.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report + "\n")
     print(f"\n[agent] rapport enregistré : {os.path.normpath(out_path)}")
@@ -265,18 +266,32 @@ def run_agent(raw_scan_text: str):
 
 
 if __name__ == "__main__":
-    scan_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scan.txt")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Triage de vulnérabilités à partir d'un scan nmap -sV"
+    )
+    parser.add_argument("scan", nargs="?", default=None,
+                        help="fichier de scan (défaut : scan.txt à la racine du projet)")
+    parser.add_argument("--top", type=int, default=5,
+                        help="CVE les plus graves gardées par logiciel (défaut : 5)")
+    parser.add_argument("--output", default=None,
+                        help="fichier du rapport (défaut : rapport.md à la racine du projet)")
+    cli = parser.parse_args()
+
+    TOP_N = cli.top
+    OUTPUT_PATH = cli.output
+    scan_path = cli.scan or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scan.txt")
+
     if os.path.exists(scan_path):
         with open(scan_path, encoding="utf-8-sig", errors="ignore") as f:
             scan_text = f.read()
-        SCAN_SOURCE = "scan.txt"
+        SCAN_SOURCE = os.path.basename(scan_path)
         print(f"[agent] scan lu depuis {os.path.normpath(scan_path)}")
     else:
-        print("[agent] scan.txt introuvable, utilisation de l'exemple")
+        print("[agent] fichier de scan introuvable, utilisation de l'exemple")
         scan_text = """
         192.168.1.10 22 ssh OpenSSH 7.4
         192.168.1.10 80 http Apache 2.4.29
         """
     run_agent(scan_text)
-
-
