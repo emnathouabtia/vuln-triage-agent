@@ -39,3 +39,9 @@ Options : `scan` (fichier de scan), `--top` (CVE les plus graves par logiciel, d
 - La traduction peut coller deux mots ; cela ne concerne ni les CVE, ni les scores, ni le tri.
 - Les CVE sont des failles possibles pour une version donnée : elles ne prouvent pas qu'une
   configuration est exploitable. À n'utiliser que sur des machines que vous avez le droit de scanner.
+
+## Tests
+    pip install pytest
+    python -m pytest -q
+
+Les tests (parser nmap, reconnaissance des logiciels) tournent hors ligne, sans clé API.
