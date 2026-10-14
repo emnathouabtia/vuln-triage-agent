@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.pyc
+scan.txt
+rapport*.md
+tests
+docs
+.pytest_cache
