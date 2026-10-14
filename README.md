@@ -1,5 +1,7 @@
 ﻿# Vuln Triage Agent
 
+![tests](https://github.com/emnathouabtia/vuln-triage-agent/actions/workflows/tests.yml/badge.svg)
+
 Agent IA de triage de vulnérabilités : il lit un scan réseau `nmap -sV`, interroge la base
 officielle NVD et produit un rapport priorisé par gravité (CVSS), multi-hôtes.
 
@@ -45,3 +47,4 @@ Options : `scan` (fichier de scan), `--top` (CVE les plus graves par logiciel, d
     python -m pytest -q
 
 Les tests (parser nmap, reconnaissance des logiciels) tournent hors ligne, sans clé API.
+
